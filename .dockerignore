@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.pytest_cache/
+uploads/
+*.db
+.git/
+.gitignore
+README.md
+corrupted.jpg
+drop_table.py

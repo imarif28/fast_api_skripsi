@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  skripsi-grafologi:
+    build: .
+    container_name: skripsi-grafologi
+    # Port host 8001 → container 8000
+    # Pakai 8001 agar tidak bentrok dengan project teman yang mungkin pakai 8000
+    ports:
+      - "8001:8000"
+    volumes:
+      # Folder uploads & database SQLite disimpan di host agar data tidak hilang saat container restart
+      - ./uploads:/app/uploads
+      - ./app_data.db:/app/app_data.db
+    env_file:
+      - .env          # File .env dibuat manual di server, tidak ikut ke GitHub
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
