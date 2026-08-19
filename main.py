@@ -1,22 +1,19 @@
 """
 main.py - FastAPI application untuk analisis kepribadian via tanda tangan
+Tidak menyimpan riwayat analisis maupun file gambar ke disk/database.
 """
 
 import os
-import json
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
-import uuid
-import shutil
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, FileResponse
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
-from database import init_db, get_db, DetectionLog, SessionLocal
+from database import init_db, get_db, SessionLocal
 from inference import SignatureDetector
 from personality import build_narrative, seed_personality_rules
 
@@ -26,9 +23,6 @@ load_dotenv()
 # Startup & Shutdown (lifespan)
 # ==============================================================================
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
 detector: SignatureDetector | None = None
 
 @asynccontextmanager
@@ -37,7 +31,7 @@ async def lifespan(app: FastAPI):
     global detector
     print("[INFO] Menginisialisasi database...")
     init_db()
-    
+
     print("[INFO] Memeriksa dan mengisi data kepribadian awal (Seeder)...")
     with SessionLocal() as db:
         seed_personality_rules(db)
@@ -59,7 +53,7 @@ app = FastAPI(
         "API untuk mendeteksi pola grafologis pada tanda tangan menggunakan "
         "model YOLOv8s (ONNX) dan memberikan interpretasi kepribadian."
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -79,6 +73,7 @@ app.add_middleware(
 @app.get("/health", tags=["System"])
 def health_check():
     """Cek apakah server sedang berjalan."""
+    from datetime import datetime
     return {
         "status": "ok",
         "message": "Server berjalan dengan baik.",
@@ -101,29 +96,22 @@ async def analyze_signature(
 
     - **file**: File gambar (JPG atau PNG)
     - **Return**: Bounding box deteksi + narasi kepribadian
+    - **Catatan**: Gambar tidak disimpan ke server setelah diproses.
     """
     # ── Validasi format file ─────────────────────────────────────────────────
     allowed_types = {"image/jpeg", "image/jpg", "image/png"}
     ext = file.filename.split('.')[-1].lower() if file.filename else ""
-    
+
     if file.content_type not in allowed_types and ext not in {"jpg", "jpeg", "png"}:
         raise HTTPException(
             status_code=400,
             detail=f"Format file tidak didukung: '{file.content_type}'. Gunakan JPG atau PNG.",
         )
 
-    # ── Baca bytes gambar ────────────────────────────────────────────────────
+    # ── Baca bytes gambar (tidak disimpan ke disk) ───────────────────────────
     image_bytes = await file.read()
     if len(image_bytes) == 0:
         raise HTTPException(status_code=400, detail="File gambar kosong.")
-
-    # ── Simpan file ke sistem (Uploads Directory) ────────────────────────────
-    file_ext = ext if ext else "jpg"
-    unique_filename = f"{uuid.uuid4().hex}.{file_ext}"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
-    
-    with open(file_path, "wb") as f:
-        f.write(image_bytes)
 
     # ── Jalankan inferensi ───────────────────────────────────────────────────
     try:
@@ -134,23 +122,10 @@ async def analyze_signature(
         raise HTTPException(status_code=500, detail=f"Kesalahan saat inferensi: {str(e)}")
 
     # ── Bangun narasi kepribadian ────────────────────────────────────────────
-    # Ambil nama kelas unik yang terdeteksi (deduplikasi untuk narasi)
     detected_class_names = list({d["class_name"] for d in detections})
     narrative = build_narrative(db, detected_class_names)
 
-    # ── Simpan log ke database ───────────────────────────────────────────────
-    log_entry = DetectionLog(
-        image_filename  = unique_filename,
-        detected_classes = json.dumps(detected_class_names, ensure_ascii=False),
-        all_confidences  = json.dumps(all_confs, ensure_ascii=False),
-        detections       = json.dumps(detections, ensure_ascii=False),
-        narrative        = narrative,
-        created_at       = datetime.utcnow(),
-    )
-    db.add(log_entry)
-    db.commit()
-
-    # ── Susun respons JSON ───────────────────────────────────────────────────
+    # ── Susun respons JSON (tanpa menyimpan apapun ke database/disk) ─────────
     return JSONResponse(
         status_code=200,
         content={
@@ -164,72 +139,3 @@ async def analyze_signature(
             },
         },
     )
-
-
-# ==============================================================================
-# Endpoint: Riwayat Analisis
-# ==============================================================================
-
-@app.get("/history", tags=["Riwayat"])
-def get_history(limit: int = 10, db: Session = Depends(get_db)):
-    """
-    Ambil riwayat analisis terbaru dari database.
-
-    - **limit**: Jumlah data yang ingin diambil (default: 10)
-    """
-    logs = (
-        db.query(DetectionLog)
-        .order_by(DetectionLog.created_at.desc())
-        .limit(limit)
-        .all()
-    )
-
-    history = []
-    for log in logs:
-        history.append({
-            "id"             : log.id,
-            "image_filename" : log.image_filename,
-            "detected_classes": json.loads(log.detected_classes),
-            "all_confidences": json.loads(log.all_confidences) if log.all_confidences else {},
-            "detections"     : json.loads(log.detections) if getattr(log, 'detections', None) else [],
-            "narrative"      : log.narrative,
-            "created_at"     : log.created_at.isoformat() if log.created_at else None,
-        })
-
-    return {"status": "success", "data": history}
-
-
-@app.get("/history/{log_id}/image", tags=["Riwayat"])
-def get_history_image(log_id: int, db: Session = Depends(get_db)):
-    """
-    Ambil gambar dari riwayat analisis berdasarkan ID.
-    """
-    log = db.query(DetectionLog).filter(DetectionLog.id == log_id).first()
-    if not log:
-        raise HTTPException(status_code=404, detail="Riwayat tidak ditemukan.")
-    
-    file_path = os.path.join(UPLOAD_DIR, log.image_filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Gambar fisik tidak ditemukan di server.")
-        
-    return FileResponse(file_path)
-
-
-@app.delete("/history/clear", tags=["Riwayat"])
-def clear_history(db: Session = Depends(get_db)):
-    """
-    Menghapus semua riwayat analisis dari database dan file gambar fisik.
-    """
-    try:
-        db.query(DetectionLog).delete()
-        db.commit()
-        
-        # Bersihkan file fisik di direktori uploads
-        for filename in os.listdir(UPLOAD_DIR):
-            file_path = os.path.join(UPLOAD_DIR, filename)
-            if os.path.isfile(file_path):
-                os.unlink(file_path)
-                
-        return {"status": "success", "message": "Semua riwayat berhasil dibersihkan."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gagal membersihkan riwayat: {e}")
